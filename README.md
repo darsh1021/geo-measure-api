@@ -160,6 +160,7 @@ Correctness is checked against pyproj's geodesic calculations on the WGS84 ellip
 - A crash mid-processing can leave a record in `PROCESSING`.
 - No authentication or rate limiting.
 - Very large geometries are stored whole in JSON columns.
+- Files crossing the antimeridian (±180°) are not handled; the UTM zone is chosen from the bbox centre, so measurements would be wrong.
 
 ## Assumptions
 - Multiple shapefiles in one zip are merged into a single feature set.
