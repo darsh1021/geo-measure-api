@@ -5,7 +5,7 @@ A FastAPI service that accepts a Shapefile (.zip) or KML, extracts every feature
 ## Setup
 
 ```bash
-git clone <repo-url> && cd GeoSpatialAPI
+git clone https://github.com/darsh1021/geo-measure-api.git && cd geo-measure-api
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
