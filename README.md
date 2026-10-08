@@ -1,78 +1,167 @@
-# GeoMeasure API
+# Geospatial File Measurement API
 
-A REST API for uploading geospatial files (GeoJSON, Shapefile, GeoPackage) and computing geometric measurements — area, length, and centroid — via FastAPI.
+A FastAPI service that accepts a Shapefile (.zip) or KML, extracts every feature, and returns area (polygons) and length (lines), calculated in a projected CRS, never in raw degrees.
 
----
-
-## Quick Start
+## Setup
 
 ```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-
+git clone <repo-url> && cd GeoSpatialAPI
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-Interactive docs available at `http://localhost:8000/docs`.
+Interactive docs: http://localhost:8000/docs
 
----
+Run the tests: `pytest -q`
 
-## Project Structure
+Try it with the included samples:
 
-```
-geo-measure-api/
-├── app/
-│   ├── main.py              # FastAPI app and router registration
-│   ├── api/
-│   │   └── files.py         # Upload and query endpoints
-│   ├── services/
-│   │   ├── parser.py        # Geospatial file parsing (GeoPandas + pyogrio)
-│   │   ├── crs.py           # CRS detection and reprojection (pyproj)
-│   │   └── measurements.py  # Area, length, centroid computation (Shapely)
-│   ├── models.py            # SQLAlchemy ORM models (SQLite)
-│   └── schemas.py           # Pydantic request/response models
-├── tests/
-├── data/uploads/            # Uploaded files (git-ignored)
-├── requirements.txt
-└── README.md
+```bash
+curl -F "file=@samples/survey.kml" http://localhost:8000/api/files/
+curl -F "file=@samples/survey_shapefile.zip" http://localhost:8000/api/files/
 ```
 
----
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/files/` | Upload and process a `.zip` (Shapefile) or `.kml` |
+| GET | `/api/files/{id}/` | File summary and status |
+| GET | `/api/files/{id}/measurements/` | Per-feature measurements (`limit`, `offset`) |
+| GET | `/api/files/{id}/features/` | Per-feature geometry, CRS, properties (extra) |
+
+### POST /api/files/  → 201
+```json
+{
+  "id": "82aa8c0086304267af273e527a063d38",
+  "filename": "survey.kml",
+  "feature_count": 3,
+  "crs": "EPSG:4326",
+  "measurement_crs": "EPSG:32643",
+  "status": "COMPLETED",
+  "error": null
+}
+```
+
+### GET /api/files/{id}/measurements/
+```json
+{
+  "id": "82aa8c0086304267af273e527a063d38",
+  "measurement_crs": "EPSG:32643",
+  "strategy": "utm",
+  "total": 3,
+  "limit": 100,
+  "offset": 0,
+  "measurements": [
+    {
+      "index": 0,
+      "geometry_type": "Polygon",
+      "measurement": "area",
+      "value": 1169894.6226,
+      "unit": "m²",
+      "status": "OK",
+      "reason": null,
+      "properties": {"Name": "Plot A"}
+    },
+    {
+      "index": 1,
+      "geometry_type": "LineString",
+      "measurement": "length",
+      "value": 3060.8103,
+      "unit": "m",
+      "status": "OK",
+      "reason": null,
+      "properties": {"Name": "Road 1"}
+    },
+    {
+      "index": 2,
+      "geometry_type": "Point",
+      "measurement": null,
+      "value": null,
+      "unit": null,
+      "status": "NOT_APPLICABLE",
+      "reason": null,
+      "properties": {"Name": "Well"}
+    }
+  ]
+}
+```
+
+Per-feature `status`: `OK`, `NOT_APPLICABLE` (points), `UNSUPPORTED` (null/empty geometry, GeometryCollection), `UNAVAILABLE` (file has no CRS).
+
+### Errors
+Every failure uses one shape:
+```json
+{
+  "error": {
+    "status": 422,
+    "code": "UNPROCESSABLE_FILE",
+    "message": "No .shp file found inside the zip",
+    "file_id": "abc123"
+  }
+}
+```
+
+| Status | code |
+|---|---|
+| 413 | FILE_TOO_LARGE |
+| 415 | UNSUPPORTED_FILE_TYPE |
+| 422 | UNPROCESSABLE_FILE, VALIDATION_ERROR |
+| 404 | NOT_FOUND |
+| 409 | CONFLICT (data requested for a FAILED file) |
+| 500 | INTERNAL_ERROR |
+
+## Architecture
+
+```
+app/
+├── main.py              app wiring, lifespan, error handlers
+├── api/files.py         HTTP endpoints, upload orchestration
+├── services/
+│   ├── parser.py        safe unzip, read Shapefile/KML, GeoDataFrame -> features
+│   ├── crs.py           choose the measurement CRS
+│   └── measurements.py  area/length with per-feature status
+├── models.py, db.py     SQLAlchemy models (SQLite)
+├── schemas.py           Pydantic response models
+└── errors.py            unified error envelope
+```
+
+**File-processing flow:** stream upload to disk (size-limited) → create `PROCESSING` record → safe-extract zip / read all KML layers → build feature records → compute measurements → persist → mark `COMPLETED` → delete the raw file. Any failure marks the record `FAILED` and returns a structured error.
+
+**Measurement flow:** select measurement CRS → reproject a copy of the data → `geom.area` / `geom.length` in metres → record result and status per feature. The geometry returned to clients stays in the file's original CRS.
+
+**CRS handling:**
+
+| Source CRS | Action |
+|---|---|
+| Missing | Measurements `UNAVAILABLE`, no guessing |
+| Projected, metric, not Web Mercator | Kept as-is |
+| Geographic or Web Mercator | Reproject to the UTM zone of the bbox centre |
+| Coordinates outside valid lon/lat for the declared CRS | Treated as mismatched, measurements `UNAVAILABLE` |
+
+Correctness is checked against pyproj's geodesic calculations on the WGS84 ellipsoid (`tests/test_measurements.py`), agreeing within 0.5%.
 
 ## Design Decisions
 
-**FastAPI over Django**
-The API surface is small and focused. FastAPI provides automatic request validation via Pydantic, auto-generated OpenAPI docs, and async support without the overhead of Django's ORM and middleware stack.
+- **FastAPI over Django:** small API surface, built-in validation and Swagger.
+- **GeoPandas + pyogrio over Fiona:** faster, easier to install.
+- **UTM over an equal-area projection:** accurate for both length and area within a zone; equal-area distorts length.
+- **One CRS per file (zone from bbox centre):** simple and predictable. Limitation: files spanning several zones lose accuracy at the edges. Upgrade: choose the zone per feature.
+- **Refuse rather than guess when CRS is missing:** a wrong assumption gives confidently wrong numbers.
+- **Invalid geometries are measured and flagged, not repaired:** repairing would silently change user data.
+- **Per-feature status instead of errors:** clients can tell "no measurement needed" from "cannot measure".
+- **SQLite with JSON columns:** zero setup. Alternative: PostgreSQL + PostGIS for spatial queries; not needed here.
+- **Synchronous processing:** simple, final status in the upload response. Alternative: Celery/RQ worker with polling; the `status` field already supports it.
+- **Measurements stored at upload:** fast, reproducible reads; old uploads do not update if logic changes.
+- **Security:** zip-slip and zip-bomb guards, size limit enforced while streaming, generated file names, no internals leaked in 500s.
 
-**GeoPandas + pyogrio over Fiona**
-`pyogrio` is a modern GDAL/OGR binding that is significantly faster than the older `fiona`-based I/O, has simpler installation (no separate GDAL wheel needed on most platforms), and is now the recommended engine for `geopandas.read_file()`.
+## Known Limitations
+- A crash mid-processing can leave a record in `PROCESSING`.
+- No authentication or rate limiting.
+- Very large geometries are stored whole in JSON columns.
 
-**Synchronous processing at upload time**
-File parsing and measurement computation happen synchronously in the request handler. This keeps the architecture simple for a development/demo context. In production, a task queue (e.g. Celery + Redis) would handle long-running geospatial operations in the background, returning a job ID for polling.
-
-**SQLite via SQLAlchemy**
-SQLite requires zero infrastructure to run locally and is sufficient for storing file metadata and cached measurement results. The SQLAlchemy abstraction makes swapping to PostgreSQL (or PostGIS) straightforward when scaling up.
-
----
-
-## Running Tests
-
-```bash
-pytest
-```
-
----
-
-## Roadmap
-
-| Phase | Goal |
-|-------|------|
-| 1 | File upload endpoint + parser service |
-| 2 | Layer summary endpoint (feature count, CRS, geometry type) |
-| 3 | Measurements endpoint (area, length, centroid) |
-| 4 | CRS reprojection support |
-| 5 | SQLite persistence for uploads and results |
+## Assumptions
+- Multiple shapefiles in one zip are merged into a single feature set.
+- Files with no CRS are stored but not measured.
+- KML altitude (Z) is ignored; measurements are planar.
